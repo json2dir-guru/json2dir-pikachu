@@ -1,0 +1,52 @@
+#!/bin/sh
+# The Pikalang evaluator (json2dir.pokeball, transliterated from the Brainfuck program
+# json2dir.bf by tools/bf2pika.py) owns UTF-8 checking, JSON parsing, validation and
+# shell generation; this launcher only moves bytes and runs the generated script.
+#
+# Transport framing only: an 8-bit cell cannot tell a NUL byte from end of input, so the
+# document is fed to the evaluator as decimal byte values (od -An -v -tu1).
+# The interpreter (Amirreza-Ipchi-Haq/Pikalang) reads `pikapi` input from /dev/tty, not
+# from stdin, so the framed input is bind-mounted over /dev/tty in a private mount
+# namespace (unshare -m as root, unshare -rm otherwise).
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+if [ "$(id -u)" = 0 ]; then ns='unshare -m'; else ns='unshare -rm'; fi
+
+if ! (
+  umask 077
+  od -An -v -tu1 < "$task_tmp/input.json" > "$task_tmp/input.dec"
+  $ns sh -c 'mount --bind "$1" /dev/tty && exec "$2" "$3"' sh \
+    "$task_tmp/input.dec" "${JSON2DIR_PIKALANG:-pikalang}" "$script_dir/json2dir.pokeball" \
+    < /dev/null > "$task_tmp/tree.sh"
+); then
+  exit 1
+fi
+
+# The script is only run if the evaluator wrote its end marker as the last line;
+# otherwise its last line is its error message.
+last=$(tail -n 1 "$task_tmp/tree.sh")
+if [ "$last" != '# json2dir: end' ]; then
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"
